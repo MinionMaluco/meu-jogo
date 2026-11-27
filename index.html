@@ -787,9 +787,9 @@
                 name: 'Fenda Oculta',
                 hint: 'Entrar na passagem secreta [E]',
                 x: 600,
-                y: 26,
-                radius: 8,
-                interactRadius: 34
+                y: 42,
+                radius: 26,
+                interactRadius: 85
             },
             {
                 id: 'board',
@@ -1650,6 +1650,137 @@
             sendPresencePacket(status);
         }
 
+        function stopOnlineMatchmakingLoop() {
+            if (onlineSyncInterval) {
+                clearInterval(onlineSyncInterval);
+                onlineSyncInterval = null;
+            }
+        }
+
+        function removeOnlinePresence() {
+            const map = readOnlineQueue();
+            if (map[localOnlineId]) {
+                delete map[localOnlineId];
+                writeOnlineQueue(map);
+            }
+            broadcastToConnections({ type: 'PEER_LEAVE', id: localOnlineId });
+        }
+
+        function applyRemoteArenaState(data) {
+            if (!data || !ai || data.senderId === localOnlineId) return;
+            if (typeof data.x === 'number' && typeof data.y === 'number') {
+                ai.x = data.x;
+                ai.y = data.y;
+            }
+            if (typeof data.angle === 'number') {
+                ai.angle = data.angle;
+            }
+            if (typeof data.hp === 'number') {
+                ai.hp = Math.max(0, Math.min(ai.maxHp, data.hp));
+            }
+            if (typeof data.debuffTimer === 'number' && data.debuffTimer > ai.debuffTimer) {
+                ai.debuffTimer = data.debuffTimer;
+            }
+            if (typeof data.stunTimer === 'number' && data.stunTimer > ai.stunTimer) {
+                ai.stunTimer = data.stunTimer;
+            }
+            if (typeof data.burnTimer === 'number' && data.burnTimer > ai.burnTimer) {
+                ai.burnTimer = data.burnTimer;
+            }
+            if (typeof data.loveTimer === 'number' && data.loveTimer > ai.loveTimer) {
+                ai.loveTimer = data.loveTimer;
+            }
+            if (typeof data.dashTimer === 'number') {
+                ai.dashTimer = data.dashTimer;
+            }
+        }
+
+        function handleNetworkMessage(msg, conn = null) {
+            if (!msg || typeof msg !== 'object') return;
+            if (msg.senderId && msg.senderId === localOnlineId) return;
+            if (msg.peer && msg.peer.id === localOnlineId) return;
+
+            if (msg.type === 'PRESENCE' && msg.peer) {
+                if (conn && msg.peer.id) {
+                    activeDataConns.set(msg.peer.id, conn);
+                }
+                handleIncomingPeer(msg.peer);
+            } else if (msg.type === 'PEER_LEAVE' && msg.id) {
+                if (remoteLobbyPlayers[msg.id]) {
+                    delete remoteLobbyPlayers[msg.id];
+                }
+            } else if (msg.type === 'MATCH_START') {
+                if (msg.hostId === localOnlineId || msg.guestId === localOnlineId) {
+                    persistActiveMatchRecord(msg);
+                    const isHostSide = msg.hostId === localOnlineId;
+                    const oppPeer = isHostSide
+                        ? { id: msg.guestId, characterId: msg.guestCharId }
+                        : { id: msg.hostId, characterId: msg.hostCharId };
+                    remoteOpponent = oppPeer;
+                    matchId = msg.matchId;
+                    broadcastToConnections({
+                        type: 'MATCH_ACK',
+                        matchId: msg.matchId,
+                        hostId: msg.hostId,
+                        guestId: msg.guestId,
+                        guestCharId: selectedCharacterId
+                    });
+                    if (currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted) {
+                        beginRealPlayerMatch(oppPeer, isHostSide);
+                    }
+                }
+            } else if (msg.type === 'MATCH_ACK') {
+                if (msg.hostId === localOnlineId || msg.guestId === localOnlineId) {
+                    const isHostSide = msg.hostId === localOnlineId;
+                    const oppPeer = isHostSide
+                        ? { id: msg.guestId, characterId: msg.guestCharId || (remoteOpponent && remoteOpponent.characterId) }
+                        : { id: msg.hostId, characterId: msg.hostCharId || (remoteOpponent && remoteOpponent.characterId) };
+                    remoteOpponent = oppPeer;
+                    if (currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted) {
+                        beginRealPlayerMatch(oppPeer, isHostSide);
+                    }
+                }
+            } else if (msg.type === 'ARENA_STATE') {
+                applyRemoteArenaState(msg);
+            } else if (msg.type === 'ARENA_ACTION' && ai && currentState === GAME_STATE.PLAYING) {
+                if (typeof msg.x === 'number') ai.x = msg.x;
+                if (typeof msg.y === 'number') ai.y = msg.y;
+                if (typeof msg.angle === 'number') ai.angle = msg.angle;
+
+                if (msg.action === 'SHOOT') {
+                    ai.shootCooldown = 0;
+                    castWaterBall(ai);
+                } else if (msg.action === 'SKILL') {
+                    if (msg.botType) {
+                        spawnMechanicRobot(ai, msg.botType);
+                    } else {
+                        ai.waveCooldown = 0;
+                        castMiniWave(ai);
+                    }
+                }
+            }
+        }
+
+        function setupDataConnection(conn) {
+            if (!conn) return;
+            conn.on('open', () => {
+                if (conn.peer) {
+                    activeDataConns.set(conn.peer, conn);
+                }
+                updateNetworkBadge(`Conectado à sala "${activeRoomCode}"!`, true);
+                sendPresencePacket();
+            });
+            conn.on('data', (data) => {
+                handleNetworkMessage(data, conn);
+            });
+            conn.on('close', () => {
+                if (conn.peer && activeDataConns.get(conn.peer) === conn) {
+                    activeDataConns.delete(conn.peer);
+                }
+            });
+            conn.on('error', () => {});
+        }
+
         function refreshRemoteLobbyPlayers() {
             const nowTs = Date.now();
             const map = pruneExpiredPeers(readOnlineQueue(), nowTs);
@@ -1687,131 +1818,6 @@
                 }
             }
         }
-
-        function applyRemoteArenaState(data) {
-            if (!data || !ai || !remoteOpponent || data.senderId !== remoteOpponent.id) return;
-            if (typeof data.x === 'number') ai.x = data.x;
-            if (typeof data.y === 'number') ai.y = data.y;
-            if (typeof data.angle === 'number') ai.angle = data.angle;
-            if (typeof data.hp === 'number') ai.hp = data.hp;
-            if (typeof data.debuffTimer === 'number') {
-                ai.debuffTimer = Math.max(ai.debuffTimer || 0, data.debuffTimer);
-            }
-            if (typeof data.stunTimer === 'number') {
-                ai.stunTimer = Math.max(ai.stunTimer || 0, data.stunTimer);
-            }
-            if (typeof data.burnTimer === 'number') {
-                ai.burnTimer = Math.max(ai.burnTimer || 0, data.burnTimer);
-            }
-            if (typeof data.loveTimer === 'number') {
-                ai.loveTimer = Math.max(ai.loveTimer || 0, data.loveTimer);
-            }
-            if (typeof data.dashTimer === 'number') {
-                ai.dashTimer = data.dashTimer;
-            }
-        }
-
-        function handleNetworkMessage(msg, conn) {
-            if (!msg || typeof msg !== 'object') return;
-            if (msg.type === 'PRESENCE' && msg.peer) {
-                handleIncomingPeer(msg.peer);
-            } else if (msg.type === 'MATCH_START') {
-                if (msg.hostId === localOnlineId || msg.guestId === localOnlineId) {
-                    const isHostSide = msg.hostId === localOnlineId;
-                    const oppPeer = isHostSide
-                        ? { id: msg.guestId, characterId: msg.guestCharId }
-                        : { id: msg.hostId, characterId: msg.hostCharId };
-                    remoteOpponent = oppPeer;
-                    matchId = msg.matchId;
-                    persistActiveMatchRecord(msg);
-                    broadcastToConnections({
-                        type: 'MATCH_ACK',
-                        matchId: msg.matchId,
-                        hostId: msg.hostId,
-                        guestId: msg.guestId,
-                        guestCharId: selectedCharacterId
-                    });
-                    beginRealPlayerMatch(oppPeer, isHostSide);
-                }
-            } else if (msg.type === 'MATCH_ACK') {
-                if (msg.hostId === localOnlineId || msg.guestId === localOnlineId) {
-                    const isHostSide = msg.hostId === localOnlineId;
-                    const oppPeer = isHostSide
-                        ? { id: msg.guestId, characterId: msg.guestCharId }
-                        : { id: msg.hostId, characterId: msg.hostCharId };
-                    remoteOpponent = oppPeer;
-                    matchId = msg.matchId;
-                    beginRealPlayerMatch(oppPeer, isHostSide);
-                }
-            } else if (msg.type === 'ARENA_STATE') {
-                applyRemoteArenaState(msg);
-            } else if (msg.type === 'ARENA_ACTION') {
-                if (!ai || !remoteOpponent || msg.senderId !== remoteOpponent.id) return;
-                if (typeof msg.x === 'number') ai.x = msg.x;
-                if (typeof msg.y === 'number') ai.y = msg.y;
-                if (typeof msg.angle === 'number') ai.angle = msg.angle;
-                if (msg.action === 'SHOOT') {
-                    ai.shootCooldown = 0;
-                    castWaterBall(ai);
-                } else if (msg.action === 'SKILL') {
-                    ai.waveCooldown = 0;
-                    if (msg.botType && ai.charConfig && ai.charConfig.id === 'mechanic') {
-                        spawnMechanicRobot(ai, msg.botType);
-                    } else {
-                        castMiniWave(ai);
-                    }
-                } else if (msg.action === 'DEBUFF_APPLIED') {
-                    if (player && msg.targetId === localOnlineId) {
-                        player.applyWaveDebuff();
-                        publishOnlinePresence('IN_MATCH');
-                        broadcastToConnections({
-                            type: 'ARENA_STATE',
-                            senderId: localOnlineId,
-                            x: player.x,
-                            y: player.y,
-                            angle: player.angle,
-                            hp: player.hp,
-                            debuffTimer: player.debuffTimer,
-                            stunTimer: player.stunTimer,
-                            burnTimer: player.burnTimer,
-                            loveTimer: player.loveTimer,
-                            dashTimer: player.dashTimer
-                        });
-                    }
-                }
-            }
-            void conn;
-        }
-
-        function setupDataConnection(conn) {
-            if (!conn) return;
-            conn.on('open', () => {
-                activeDataConns.set(conn.peer, conn);
-                sendPresencePacket();
-            });
-            conn.on('data', (msg) => {
-                handleNetworkMessage(msg, conn);
-            });
-            conn.on('close', () => {
-                activeDataConns.delete(conn.peer);
-            });
-        }
-
-        function stopOnlineMatchmakingLoop() {
-            if (onlineSyncInterval) {
-                clearInterval(onlineSyncInterval);
-                onlineSyncInterval = null;
-            }
-        }
-
-        function removeOnlinePresence() {
-            const map = readOnlineQueue();
-            if (map[localOnlineId]) {
-                delete map[localOnlineId];
-                writeOnlineQueue(map);
-            }
-        }
-
         function startLobbyPresenceSync() {
             if (!peerInstance) {
                 initMultiplayerNetwork(activeRoomCode);
@@ -2819,8 +2825,8 @@
 
             if (currentState === GAME_STATE.SECRET_ROOM) {
                 const secretObstacles = [
-                    { x: 300, y: 185, w: 120, h: 175 }, // Cama real detalhada
-                    { x: 765, y: 185, w: 135, h: 72 }   // Bancada antiga do Mecânico
+                    { x: 300, y: 185, w: 120, h: 175 }, // Cama vermelha
+                    { x: 765, y: 185, w: 135, h: 72 }   // Bancada com orbe roxa e peças
                 ];
                 if (commonPersonPresent) {
                     secretObstacles.push({
@@ -2860,6 +2866,13 @@
             }
 
             resolveEntityWalls(lobbyPlayer, lobbyObstacles);
+
+            // Permite entrar na Sala Secreta ao alcançar a fenda no topo atrás do Belial
+            const hatch = lobbyInteractables.find(item => item.id === 'secret_hatch');
+            if (hatch && Math.hypot(lobbyPlayer.x - hatch.x, lobbyPlayer.y - hatch.y) <= hatch.radius + lobbyPlayer.radius * 0.6) {
+                enterSecretRoom();
+                return;
+            }
 
             // Detecta proximidade com os elementos interativos da Oficina
             let closest = null;
@@ -3326,14 +3339,6 @@
                             target.applyLove(wave.owner, 3.5);
                         } else {
                             target.applyWaveDebuff();
-                            if (wave.ownerIsPlayer && remoteOpponent) {
-                                broadcastToConnections({
-                                    type: 'ARENA_ACTION',
-                                    senderId: localOnlineId,
-                                    targetId: remoteOpponent.id,
-                                    action: 'DEBUFF_APPLIED'
-                                });
-                            }
                         }
                         waves.splice(i, 1);
                         continue;
@@ -3916,6 +3921,182 @@
 
             ctx.restore();
             void now;
+        }
+
+        function renderSecretRoom(now = 0) {
+            ctx.fillStyle = '#050914';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.save();
+            ctx.translate(offsetX, offsetY);
+            ctx.scale(renderScale, renderScale);
+
+            // Quarto menor secreto em tons de azul
+            ctx.fillStyle = '#0f2342';
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.55)';
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.roundRect(
+                secretRoomBounds.left,
+                secretRoomBounds.top,
+                secretRoomBounds.right - secretRoomBounds.left,
+                secretRoomBounds.bottom - secretRoomBounds.top,
+                22
+            );
+            ctx.fill();
+            ctx.stroke();
+
+            // Saída na parte inferior do quarto
+            ctx.fillStyle = '#071124';
+            ctx.fillRect(554, secretRoomBounds.bottom - 4, 92, 10);
+            ctx.font = 'bold 11px "Plus Jakarta Sans", sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#cbd5e1';
+            ctx.fillText('SAÍDA', 600, secretRoomBounds.bottom + 22);
+
+            // Cama com fundo marrom e coberta vermelha à esquerda
+            ctx.save();
+            ctx.translate(300, 185);
+            ctx.fillStyle = '#5c3419';
+            ctx.strokeStyle = '#3b1f0e';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.roundRect(0, 0, 120, 175, 12);
+            ctx.fill();
+            ctx.stroke();
+
+            // Coberta vermelha
+            ctx.fillStyle = '#dc2626';
+            ctx.beginPath();
+            ctx.roundRect(8, 48, 104, 118, 8);
+            ctx.fill();
+
+            // Travesseiro
+            ctx.fillStyle = '#f8fafc';
+            ctx.beginPath();
+            ctx.roundRect(18, 12, 84, 28, 7);
+            ctx.fill();
+            ctx.restore();
+
+            // Bancada com orbe roxa e peças à direita
+            ctx.save();
+            ctx.translate(765, 185);
+            ctx.fillStyle = '#272038';
+            ctx.strokeStyle = '#7e22ce';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.roundRect(0, 0, 135, 72, 10);
+            ctx.fill();
+            ctx.stroke();
+
+            // Orbe roxa brilhante sobre a bancada
+            const orbPulse = Math.sin(now * 0.004) * 2;
+            const orbGrad = ctx.createRadialGradient(42, 34, 2, 42, 34, 16 + orbPulse);
+            orbGrad.addColorStop(0, '#f3e8ff');
+            orbGrad.addColorStop(0.5, '#a855f7');
+            orbGrad.addColorStop(1, 'rgba(126, 34, 206, 0)');
+            ctx.fillStyle = orbGrad;
+            ctx.beginPath();
+            ctx.arc(42, 34, 16 + orbPulse, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.fillStyle = '#c084fc';
+            ctx.beginPath();
+            ctx.arc(42, 34, 9, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Peças metálicas na bancada
+            ctx.fillStyle = '#94a3b8';
+            ctx.beginPath();
+            ctx.arc(86, 26, 6, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillRect(76, 44, 22, 6);
+            ctx.fillRect(104, 22, 12, 12);
+            ctx.restore();
+
+            // Pessoa Comum com chapéu de detetive cinza
+            if (commonPersonPresent) {
+                ctx.save();
+                ctx.translate(commonPersonNpc.x, commonPersonNpc.y);
+
+                ctx.fillStyle = 'rgba(0,0,0,0.45)';
+                ctx.beginPath();
+                ctx.ellipse(0, 18, 18, 8, 0, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.fillStyle = '#64748b';
+                ctx.strokeStyle = '#cbd5e1';
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                ctx.arc(0, 0, commonPersonNpc.radius, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+
+                // Olhos
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath();
+                ctx.arc(-6, -2, 3, 0, Math.PI * 2);
+                ctx.arc(6, -2, 3, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Chapéu de detetive cinza
+                ctx.fillStyle = '#475569';
+                ctx.strokeStyle = '#94a3b8';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.ellipse(0, -14, 24, 6, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.roundRect(-13, -27, 26, 14, 5);
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.font = 'bold 12px "Plus Jakarta Sans", sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillStyle = '#e2e8f0';
+                ctx.fillText('Pessoa Comum', 0, 36);
+                ctx.restore();
+            }
+
+            // Jogador na Sala Secreta
+            const char = CHARACTERS[selectedCharacterId];
+            const bobOffset = Math.sin(lobbyPlayer.bobPhase) * 2.5;
+            ctx.save();
+            ctx.translate(lobbyPlayer.x, lobbyPlayer.y + bobOffset);
+
+            ctx.fillStyle = 'rgba(0,0,0,0.45)';
+            ctx.beginPath();
+            ctx.ellipse(0, 18 - bobOffset, 18, 8, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            const pGrad = ctx.createRadialGradient(-5, -5, 3, 0, 0, lobbyPlayer.radius);
+            pGrad.addColorStop(0, '#ffffff');
+            pGrad.addColorStop(0.5, char.themeColor);
+            pGrad.addColorStop(1, char.darkColor);
+
+            ctx.fillStyle = pGrad;
+            ctx.shadowColor = char.themeColor;
+            ctx.shadowBlur = 16;
+            ctx.beginPath();
+            ctx.arc(0, 0, lobbyPlayer.radius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+
+            ctx.strokeStyle = char.themeColor;
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+
+            ctx.rotate(lobbyPlayer.angle);
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath();
+            ctx.arc(8, -6, 3.2, 0, Math.PI * 2);
+            ctx.arc(8, 6, 3.2, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+
+            ctx.restore();
         }
 
         // Renderização Completa no Canvas
