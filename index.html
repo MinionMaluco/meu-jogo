@@ -503,6 +503,7 @@
         let activeRoomCode = 'OFICINA_GLOBAL';
         let isRoomHost = false;
         let matchId = '';
+        let lastMatchedPeerId = null;
 
         if (typeof BroadcastChannel !== 'undefined') {
             try {
@@ -1554,12 +1555,14 @@
         }
 
         function pruneExpiredPeers(map, nowTs = Date.now()) {
-            for (const key of Object.keys(map)) {
-                if (!map[key] || nowTs - (map[key].lastSeen || 0) > 6500) {
-                    delete map[key];
+            const cleaned = {};
+            for (const key of Object.keys(map || {})) {
+                const entry = map[key];
+                if (entry && entry.id && nowTs - (entry.lastSeen || 0) <= 6500) {
+                    cleaned[key] = entry;
                 }
             }
-            return map;
+            return cleaned;
         }
 
         function readActiveMatches() {
@@ -1584,25 +1587,44 @@
             if (!record || !record.matchId) return;
             const nowTs = Date.now();
             const map = readActiveMatches();
+            const nextMap = {};
             for (const k of Object.keys(map)) {
-                if (!map[k] || nowTs - (map[k].createdAt || 0) > 15000) {
-                    delete map[k];
+                const item = map[k];
+                if (item && nowTs - (item.createdAt || 0) <= 12000) {
+                    nextMap[k] = item;
                 }
             }
-            map[record.matchId] = { ...record, createdAt: nowTs };
-            writeActiveMatches(map);
+            nextMap[record.matchId] = { ...record, createdAt: record.createdAt || nowTs };
+            writeActiveMatches(nextMap);
+        }
+
+        function clearActiveMatchesForLocalPlayer() {
+            const map = readActiveMatches();
+            let changed = false;
+            for (const k of Object.keys(map)) {
+                const m = map[k];
+                if (!m || m.hostId === localOnlineId || m.guestId === localOnlineId) {
+                    delete map[k];
+                    changed = true;
+                }
+            }
+            if (changed) writeActiveMatches(map);
         }
 
         function findSharedMatchForLocalPlayer() {
             const nowTs = Date.now();
             const map = readActiveMatches();
+            let latest = null;
             for (const m of Object.values(map)) {
-                if (!m || nowTs - (m.createdAt || 0) > 15000) continue;
+                if (!m || nowTs - (m.createdAt || 0) > 12000) continue;
+                if (sanitizeRoomCode(m.roomCode || 'OFICINA_GLOBAL') !== sanitizeRoomCode(activeRoomCode)) continue;
                 if (m.hostId === localOnlineId || m.guestId === localOnlineId) {
-                    return m;
+                    if (!latest || (m.createdAt || 0) >= (latest.createdAt || 0)) {
+                        latest = m;
+                    }
                 }
             }
-            return null;
+            return latest;
         }
 
         function buildLocalPeerState(statusOverride = null) {
@@ -1614,7 +1636,7 @@
             const stateObj = {
                 id: localOnlineId,
                 peerId: peerInstance ? peerInstance.id : localOnlineId,
-                roomCode: activeRoomCode,
+                roomCode: sanitizeRoomCode(activeRoomCode),
                 characterId: selectedCharacterId,
                 status: status,
                 x: lobbyPlayer.x,
@@ -1646,7 +1668,7 @@
             broadcastToConnections({ type: 'PRESENCE', peer: peerData });
         }
 
-        function publishOnlinePresence(status = 'WAITING') {
+        function publishOnlinePresence(status = null) {
             sendPresencePacket(status);
         }
 
@@ -1657,12 +1679,20 @@
             }
         }
 
+        function stopMatchHandshakeLoop() {
+            if (matchHandshakeInterval) {
+                clearInterval(matchHandshakeInterval);
+                matchHandshakeInterval = null;
+            }
+        }
+
         function removeOnlinePresence() {
             const map = readOnlineQueue();
             if (map[localOnlineId]) {
                 delete map[localOnlineId];
                 writeOnlineQueue(map);
             }
+            clearActiveMatchesForLocalPlayer();
             broadcastToConnections({ type: 'PEER_LEAVE', id: localOnlineId });
         }
 
@@ -1709,18 +1739,23 @@
                 if (remoteLobbyPlayers[msg.id]) {
                     delete remoteLobbyPlayers[msg.id];
                 }
+                if (remoteOpponent && remoteOpponent.id === msg.id && currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted) {
+                    remoteOpponent = null;
+                }
             } else if (msg.type === 'MATCH_START') {
                 if (msg.hostId === localOnlineId || msg.guestId === localOnlineId) {
+                    if (msg.roomCode && sanitizeRoomCode(msg.roomCode) !== sanitizeRoomCode(activeRoomCode)) return;
                     persistActiveMatchRecord(msg);
                     const isHostSide = msg.hostId === localOnlineId;
                     const oppPeer = isHostSide
-                        ? { id: msg.guestId, characterId: msg.guestCharId }
-                        : { id: msg.hostId, characterId: msg.hostCharId };
+                        ? { id: msg.guestId, characterId: msg.guestCharId, roomCode: msg.roomCode }
+                        : { id: msg.hostId, characterId: msg.hostCharId, roomCode: msg.roomCode };
                     remoteOpponent = oppPeer;
                     matchId = msg.matchId;
                     broadcastToConnections({
                         type: 'MATCH_ACK',
                         matchId: msg.matchId,
+                        roomCode: msg.roomCode || activeRoomCode,
                         hostId: msg.hostId,
                         guestId: msg.guestId,
                         guestCharId: selectedCharacterId
@@ -1731,10 +1766,11 @@
                 }
             } else if (msg.type === 'MATCH_ACK') {
                 if (msg.hostId === localOnlineId || msg.guestId === localOnlineId) {
+                    if (msg.roomCode && sanitizeRoomCode(msg.roomCode) !== sanitizeRoomCode(activeRoomCode)) return;
                     const isHostSide = msg.hostId === localOnlineId;
                     const oppPeer = isHostSide
-                        ? { id: msg.guestId, characterId: msg.guestCharId || (remoteOpponent && remoteOpponent.characterId) }
-                        : { id: msg.hostId, characterId: msg.hostCharId || (remoteOpponent && remoteOpponent.characterId) };
+                        ? { id: msg.guestId, characterId: msg.guestCharId || (remoteOpponent && remoteOpponent.characterId), roomCode: msg.roomCode }
+                        : { id: msg.hostId, characterId: msg.hostCharId || (remoteOpponent && remoteOpponent.characterId), roomCode: msg.roomCode };
                     remoteOpponent = oppPeer;
                     if (currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted) {
                         beginRealPlayerMatch(oppPeer, isHostSide);
@@ -1784,22 +1820,34 @@
         function refreshRemoteLobbyPlayers() {
             const nowTs = Date.now();
             const map = pruneExpiredPeers(readOnlineQueue(), nowTs);
+            const myRoom = sanitizeRoomCode(activeRoomCode);
             const merged = {};
 
             for (const [key, val] of Object.entries(remoteLobbyPlayers)) {
-                if (key !== localOnlineId && val && nowTs - (val.lastSeen || 0) <= 6500 && val.status !== 'IN_MATCH') {
+                if (
+                    key !== localOnlineId &&
+                    val &&
+                    nowTs - (val.lastSeen || 0) <= 6500 &&
+                    sanitizeRoomCode(val.roomCode || 'OFICINA_GLOBAL') === myRoom &&
+                    val.status !== 'IN_MATCH'
+                ) {
                     merged[key] = val;
                 }
             }
 
             for (const key of Object.keys(map)) {
-                if (key !== localOnlineId && map[key] && map[key].status !== 'IN_MATCH') {
-                    merged[key] = map[key];
+                const entry = map[key];
+                if (
+                    key !== localOnlineId &&
+                    entry &&
+                    sanitizeRoomCode(entry.roomCode || 'OFICINA_GLOBAL') === myRoom &&
+                    entry.status !== 'IN_MATCH'
+                ) {
+                    merged[key] = entry;
                 }
             }
             remoteLobbyPlayers = merged;
 
-            // Sincroniza estado da arena via fila compartilhada caso o WebRTC esteja bloqueado no ambiente
             if (remoteOpponent && map[remoteOpponent.id] && map[remoteOpponent.id].status === 'IN_MATCH') {
                 const opp = map[remoteOpponent.id];
                 if (typeof opp.arenaX === 'number' && typeof opp.arenaY === 'number') {
@@ -1818,12 +1866,19 @@
                 }
             }
         }
+
         function startLobbyPresenceSync() {
             if (!peerInstance) {
                 initMultiplayerNetwork(activeRoomCode);
             }
-            publishOnlinePresence(currentState === GAME_STATE.WAITING_PLAYERS ? 'WAITING' : 'LOBBY');
+            const initialStatus = currentState === GAME_STATE.WAITING_PLAYERS
+                ? 'WAITING'
+                : (currentState === GAME_STATE.PLAYING || currentState === GAME_STATE.ROUND_INTRO || currentState === GAME_STATE.ROUND_OVER)
+                    ? 'IN_MATCH'
+                    : 'LOBBY';
+            publishOnlinePresence(initialStatus);
             refreshRemoteLobbyPlayers();
+
             if (lobbyPresenceInterval) {
                 clearInterval(lobbyPresenceInterval);
             }
@@ -1850,12 +1905,16 @@
                         dashTimer: player.dashTimer
                     });
                 }
-            }, 50);
+            }, 80);
         }
+
         function handleIncomingPeer(peer) {
             if (!peer || !peer.id || peer.id === localOnlineId) return;
-            const nowTs = Date.now();
-            peer.lastSeen = nowTs;
+            const myRoom = sanitizeRoomCode(activeRoomCode);
+            const peerRoom = sanitizeRoomCode(peer.roomCode || 'OFICINA_GLOBAL');
+            if (peerRoom !== myRoom) return;
+
+            peer.lastSeen = Date.now();
 
             if (peer.status !== 'IN_MATCH') {
                 remoteLobbyPlayers[peer.id] = peer;
@@ -1879,10 +1938,8 @@
                 }
             }
 
-            if (currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted) {
-                if (peer.status === 'WAITING') {
-                    initiateHandshakeWithPeer(peer);
-                }
+            if (currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted && peer.status === 'WAITING') {
+                initiateHandshakeWithPeer(peer);
             }
         }
 
@@ -1899,6 +1956,7 @@
             const startPayload = {
                 type: 'MATCH_START',
                 matchId: deterministicMatchId,
+                roomCode: sanitizeRoomCode(activeRoomCode),
                 hostId: amHost ? localOnlineId : peer.id,
                 hostCharId: amHost ? selectedCharacterId : peer.characterId,
                 guestId: amHost ? peer.id : localOnlineId,
@@ -1908,20 +1966,17 @@
             persistActiveMatchRecord(startPayload);
             broadcastToConnections(startPayload);
 
-            // Reenvia o anúncio por 2s para garantir entrega em qualquer canal
-            if (matchHandshakeInterval) clearInterval(matchHandshakeInterval);
+            stopMatchHandshakeLoop();
             let retries = 0;
             matchHandshakeInterval = setInterval(() => {
                 retries++;
-                if (retries > 12) {
-                    clearInterval(matchHandshakeInterval);
-                    matchHandshakeInterval = null;
+                if (retries > 10 || onlineMatchStarted) {
+                    stopMatchHandshakeLoop();
                     return;
                 }
                 broadcastToConnections(startPayload);
-            }, 150);
+            }, 140);
 
-            // Ambos os jogadores entram imediatamente ao detectar o par na fila
             beginRealPlayerMatch(peer, amHost);
         }
 
@@ -1929,18 +1984,18 @@
             if (currentState !== GAME_STATE.WAITING_PLAYERS || onlineMatchStarted) return;
             publishOnlinePresence('WAITING');
 
-            // 1. Verifica se já existe partida ativa registrada para este jogador
             const sharedMatch = findSharedMatchForLocalPlayer();
             if (sharedMatch) {
                 const isHostSide = sharedMatch.hostId === localOnlineId;
                 const oppPeer = isHostSide
-                    ? { id: sharedMatch.guestId, characterId: sharedMatch.guestCharId }
-                    : { id: sharedMatch.hostId, characterId: sharedMatch.hostCharId };
+                    ? { id: sharedMatch.guestId, characterId: sharedMatch.guestCharId, roomCode: sharedMatch.roomCode }
+                    : { id: sharedMatch.hostId, characterId: sharedMatch.hostCharId, roomCode: sharedMatch.roomCode };
                 remoteOpponent = oppPeer;
                 matchId = sharedMatch.matchId;
                 broadcastToConnections({
                     type: 'MATCH_ACK',
                     matchId: sharedMatch.matchId,
+                    roomCode: sharedMatch.roomCode || activeRoomCode,
                     hostId: sharedMatch.hostId,
                     guestId: sharedMatch.guestId,
                     guestCharId: selectedCharacterId
@@ -1950,21 +2005,36 @@
             }
 
             const nowTs = Date.now();
+            const myRoom = sanitizeRoomCode(activeRoomCode);
             const map = pruneExpiredPeers(readOnlineQueue(), nowTs);
 
             const candidates = new Map();
             for (const p of Object.values(map)) {
-                if (p && p.id && p.id !== localOnlineId && p.status === 'WAITING' && (nowTs - (p.lastSeen || 0) <= 6500)) {
+                if (
+                    p &&
+                    p.id &&
+                    p.id !== localOnlineId &&
+                    p.status === 'WAITING' &&
+                    sanitizeRoomCode(p.roomCode || 'OFICINA_GLOBAL') === myRoom &&
+                    (nowTs - (p.lastSeen || 0) <= 6500)
+                ) {
                     candidates.set(p.id, p);
                 }
             }
             for (const p of Object.values(remoteLobbyPlayers)) {
-                if (p && p.id && p.id !== localOnlineId && p.status === 'WAITING' && (nowTs - (p.lastSeen || 0) <= 6500)) {
+                if (
+                    p &&
+                    p.id &&
+                    p.id !== localOnlineId &&
+                    p.status === 'WAITING' &&
+                    sanitizeRoomCode(p.roomCode || 'OFICINA_GLOBAL') === myRoom &&
+                    (nowTs - (p.lastSeen || 0) <= 6500)
+                ) {
                     candidates.set(p.id, p);
                 }
             }
 
-            const waitingList = Array.from(candidates.values());
+            const waitingList = Array.from(candidates.values()).sort((a, b) => String(a.id).localeCompare(String(b.id)));
             if (waitingList.length > 0) {
                 initiateHandshakeWithPeer(waitingList[0]);
             } else {
@@ -1975,9 +2045,11 @@
 
         function enterWaitingForRealPlayers() {
             initAudio();
+            clearActiveMatchesForLocalPlayer();
             currentState = GAME_STATE.WAITING_PLAYERS;
             onlineMatchStarted = false;
             remoteOpponent = null;
+            matchId = '';
 
             startScreen.classList.add('hidden');
             endScreen.classList.add('hidden');
@@ -1999,17 +2071,18 @@
                 initMultiplayerNetwork(activeRoomCode);
             }
             stopOnlineMatchmakingLoop();
+            stopMatchHandshakeLoop();
             publishOnlinePresence('WAITING');
             pollRealPlayers();
-            onlineSyncInterval = setInterval(pollRealPlayers, 500);
+            onlineSyncInterval = setInterval(pollRealPlayers, 350);
         }
 
         function cancelWaitingForRealPlayers() {
             stopOnlineMatchmakingLoop();
-            if (matchHandshakeInterval) {
-                clearInterval(matchHandshakeInterval);
-                matchHandshakeInterval = null;
-            }
+            stopMatchHandshakeLoop();
+            clearActiveMatchesForLocalPlayer();
+            onlineMatchStarted = false;
+            remoteOpponent = null;
             publishOnlinePresence('LOBBY');
             document.getElementById('waitingPlayersScreen').classList.add('hidden');
             enterLobby();
@@ -2018,7 +2091,9 @@
         function beginRealPlayerMatch(peer, amHost = true) {
             if (onlineMatchStarted) return;
             onlineMatchStarted = true;
+            lastMatchedPeerId = peer && peer.id ? peer.id : null;
             stopOnlineMatchmakingLoop();
+            stopMatchHandshakeLoop();
             publishOnlinePresence('IN_MATCH');
             document.getElementById('waitingPlayersScreen').classList.add('hidden');
             const peerChar = (peer && peer.characterId && CHARACTERS[peer.characterId])
