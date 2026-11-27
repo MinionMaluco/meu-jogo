@@ -1687,6 +1687,131 @@
                 }
             }
         }
+
+        function applyRemoteArenaState(data) {
+            if (!data || !ai || !remoteOpponent || data.senderId !== remoteOpponent.id) return;
+            if (typeof data.x === 'number') ai.x = data.x;
+            if (typeof data.y === 'number') ai.y = data.y;
+            if (typeof data.angle === 'number') ai.angle = data.angle;
+            if (typeof data.hp === 'number') ai.hp = data.hp;
+            if (typeof data.debuffTimer === 'number') {
+                ai.debuffTimer = Math.max(ai.debuffTimer || 0, data.debuffTimer);
+            }
+            if (typeof data.stunTimer === 'number') {
+                ai.stunTimer = Math.max(ai.stunTimer || 0, data.stunTimer);
+            }
+            if (typeof data.burnTimer === 'number') {
+                ai.burnTimer = Math.max(ai.burnTimer || 0, data.burnTimer);
+            }
+            if (typeof data.loveTimer === 'number') {
+                ai.loveTimer = Math.max(ai.loveTimer || 0, data.loveTimer);
+            }
+            if (typeof data.dashTimer === 'number') {
+                ai.dashTimer = data.dashTimer;
+            }
+        }
+
+        function handleNetworkMessage(msg, conn) {
+            if (!msg || typeof msg !== 'object') return;
+            if (msg.type === 'PRESENCE' && msg.peer) {
+                handleIncomingPeer(msg.peer);
+            } else if (msg.type === 'MATCH_START') {
+                if (msg.hostId === localOnlineId || msg.guestId === localOnlineId) {
+                    const isHostSide = msg.hostId === localOnlineId;
+                    const oppPeer = isHostSide
+                        ? { id: msg.guestId, characterId: msg.guestCharId }
+                        : { id: msg.hostId, characterId: msg.hostCharId };
+                    remoteOpponent = oppPeer;
+                    matchId = msg.matchId;
+                    persistActiveMatchRecord(msg);
+                    broadcastToConnections({
+                        type: 'MATCH_ACK',
+                        matchId: msg.matchId,
+                        hostId: msg.hostId,
+                        guestId: msg.guestId,
+                        guestCharId: selectedCharacterId
+                    });
+                    beginRealPlayerMatch(oppPeer, isHostSide);
+                }
+            } else if (msg.type === 'MATCH_ACK') {
+                if (msg.hostId === localOnlineId || msg.guestId === localOnlineId) {
+                    const isHostSide = msg.hostId === localOnlineId;
+                    const oppPeer = isHostSide
+                        ? { id: msg.guestId, characterId: msg.guestCharId }
+                        : { id: msg.hostId, characterId: msg.hostCharId };
+                    remoteOpponent = oppPeer;
+                    matchId = msg.matchId;
+                    beginRealPlayerMatch(oppPeer, isHostSide);
+                }
+            } else if (msg.type === 'ARENA_STATE') {
+                applyRemoteArenaState(msg);
+            } else if (msg.type === 'ARENA_ACTION') {
+                if (!ai || !remoteOpponent || msg.senderId !== remoteOpponent.id) return;
+                if (typeof msg.x === 'number') ai.x = msg.x;
+                if (typeof msg.y === 'number') ai.y = msg.y;
+                if (typeof msg.angle === 'number') ai.angle = msg.angle;
+                if (msg.action === 'SHOOT') {
+                    ai.shootCooldown = 0;
+                    castWaterBall(ai);
+                } else if (msg.action === 'SKILL') {
+                    ai.waveCooldown = 0;
+                    if (msg.botType && ai.charConfig && ai.charConfig.id === 'mechanic') {
+                        spawnMechanicRobot(ai, msg.botType);
+                    } else {
+                        castMiniWave(ai);
+                    }
+                } else if (msg.action === 'DEBUFF_APPLIED') {
+                    if (player && msg.targetId === localOnlineId) {
+                        player.applyWaveDebuff();
+                        publishOnlinePresence('IN_MATCH');
+                        broadcastToConnections({
+                            type: 'ARENA_STATE',
+                            senderId: localOnlineId,
+                            x: player.x,
+                            y: player.y,
+                            angle: player.angle,
+                            hp: player.hp,
+                            debuffTimer: player.debuffTimer,
+                            stunTimer: player.stunTimer,
+                            burnTimer: player.burnTimer,
+                            loveTimer: player.loveTimer,
+                            dashTimer: player.dashTimer
+                        });
+                    }
+                }
+            }
+            void conn;
+        }
+
+        function setupDataConnection(conn) {
+            if (!conn) return;
+            conn.on('open', () => {
+                activeDataConns.set(conn.peer, conn);
+                sendPresencePacket();
+            });
+            conn.on('data', (msg) => {
+                handleNetworkMessage(msg, conn);
+            });
+            conn.on('close', () => {
+                activeDataConns.delete(conn.peer);
+            });
+        }
+
+        function stopOnlineMatchmakingLoop() {
+            if (onlineSyncInterval) {
+                clearInterval(onlineSyncInterval);
+                onlineSyncInterval = null;
+            }
+        }
+
+        function removeOnlinePresence() {
+            const map = readOnlineQueue();
+            if (map[localOnlineId]) {
+                delete map[localOnlineId];
+                writeOnlineQueue(map);
+            }
+        }
+
         function startLobbyPresenceSync() {
             if (!peerInstance) {
                 initMultiplayerNetwork(activeRoomCode);
@@ -3201,6 +3326,14 @@
                             target.applyLove(wave.owner, 3.5);
                         } else {
                             target.applyWaveDebuff();
+                            if (wave.ownerIsPlayer && remoteOpponent) {
+                                broadcastToConnections({
+                                    type: 'ARENA_ACTION',
+                                    senderId: localOnlineId,
+                                    targetId: remoteOpponent.id,
+                                    action: 'DEBUFF_APPLIED'
+                                });
+                            }
                         }
                         waves.splice(i, 1);
                         continue;
