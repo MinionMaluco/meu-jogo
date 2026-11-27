@@ -543,42 +543,16 @@
                     broadcastChannel.postMessage(payload);
                 } catch (e) {}
             }
-        }
-
-        function setupDataConnection(conn) {
-            if (!conn) return;
-            conn.on('open', () => {
-                activeDataConns.set(conn.peer, conn);
-                updateNetworkBadge('Conectado à sala online! Sincronizando jogadores...', true);
-                sendPresencePacket();
-                if (currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted) {
-                    pollRealPlayers();
-                }
-            });
-            conn.on('data', (data) => {
-                handleNetworkMessage(data, conn);
-            });
-            conn.on('close', () => {
-                activeDataConns.delete(conn.peer);
-                handlePeerDisconnected(conn.peer);
-            });
-            conn.on('error', () => {
-                activeDataConns.delete(conn.peer);
-            });
-        }
-
-        function handlePeerDisconnected(peerKey) {
-            for (const [id, p] of Object.entries(remoteLobbyPlayers)) {
-                if (id === peerKey || p.peerId === peerKey) {
-                    delete remoteLobbyPlayers[id];
-                }
-            }
-            if (remoteOpponent && (remoteOpponent.id === peerKey || remoteOpponent.peerId === peerKey)) {
-                remoteOpponent = null;
-                if (currentState === GAME_STATE.PLAYING || currentState === GAME_STATE.ROUND_INTRO || currentState === GAME_STATE.ROUND_OVER) {
-                    onlineMatchStarted = false;
-                    enterWaitingForRealPlayers();
-                }
+            // Fallback via localStorage para abas/iframes onde BroadcastChannel ou WebRTC não alcancem
+            if (payload && (payload.type === 'MATCH_START' || payload.type === 'MATCH_ACK' || payload.type === 'ARENA_ACTION')) {
+                try {
+                    if (window.localStorage) {
+                        window.localStorage.setItem(
+                            'arena_elemental_evt_v3',
+                            JSON.stringify({ ...payload, _ts: Date.now(), _nonce: Math.random() })
+                        );
+                    }
+                } catch (e) {}
             }
         }
 
@@ -1637,7 +1611,7 @@
                 (currentState === GAME_STATE.PLAYING || currentState === GAME_STATE.ROUND_INTRO || currentState === GAME_STATE.ROUND_OVER) ? 'IN_MATCH' :
                 'LOBBY'
             );
-            return {
+            const stateObj = {
                 id: localOnlineId,
                 peerId: peerInstance ? peerInstance.id : localOnlineId,
                 roomCode: activeRoomCode,
@@ -1650,6 +1624,18 @@
                 inSecretRoom: currentState === GAME_STATE.SECRET_ROOM,
                 lastSeen: Date.now()
             };
+            if (status === 'IN_MATCH' && player) {
+                stateObj.arenaX = player.x;
+                stateObj.arenaY = player.y;
+                stateObj.arenaAngle = player.angle;
+                stateObj.arenaHp = player.hp;
+                stateObj.debuffTimer = player.debuffTimer;
+                stateObj.stunTimer = player.stunTimer;
+                stateObj.burnTimer = player.burnTimer;
+                stateObj.loveTimer = player.loveTimer;
+                stateObj.dashTimer = player.dashTimer;
+            }
+            return stateObj;
         }
 
         function sendPresencePacket(statusOverride = null) {
@@ -1681,107 +1667,26 @@
                 }
             }
             remoteLobbyPlayers = merged;
-        }
 
-        function handleNetworkMessage(msg, conn = null) {
-            if (!msg || !msg.type) return;
-
-            if (msg.type === 'PRESENCE' && msg.peer) {
-                if (conn && msg.peer.id) {
-                    msg.peer.peerId = conn.peer;
+            // Sincroniza estado da arena via fila compartilhada caso o WebRTC esteja bloqueado no ambiente
+            if (remoteOpponent && map[remoteOpponent.id] && map[remoteOpponent.id].status === 'IN_MATCH') {
+                const opp = map[remoteOpponent.id];
+                if (typeof opp.arenaX === 'number' && typeof opp.arenaY === 'number') {
+                    applyRemoteArenaState({
+                        senderId: opp.id,
+                        x: opp.arenaX,
+                        y: opp.arenaY,
+                        angle: opp.arenaAngle || 0,
+                        hp: typeof opp.arenaHp === 'number' ? opp.arenaHp : (ai ? ai.hp : 250),
+                        debuffTimer: opp.debuffTimer || 0,
+                        stunTimer: opp.stunTimer || 0,
+                        burnTimer: opp.burnTimer || 0,
+                        loveTimer: opp.loveTimer || 0,
+                        dashTimer: opp.dashTimer || 0
+                    });
                 }
-                handleIncomingPeer(msg.peer);
-            } else if (msg.type === 'LEAVE' && msg.id) {
-                handlePeerDisconnected(msg.id);
-            } else if (msg.type === 'MATCH_START') {
-                if (msg.guestId === localOnlineId || msg.hostId === localOnlineId) {
-                    const isHostSide = msg.hostId === localOnlineId;
-                    const oppPeer = isHostSide
-                        ? { id: msg.guestId, characterId: msg.guestCharId }
-                        : { id: msg.hostId, characterId: msg.hostCharId };
-                    remoteOpponent = oppPeer;
-                    matchId = msg.matchId;
-                    persistActiveMatchRecord(msg);
-
-                    if (!isHostSide) {
-                        broadcastToConnections({
-                            type: 'MATCH_ACK',
-                            matchId: msg.matchId,
-                            hostId: msg.hostId,
-                            guestId: localOnlineId,
-                            guestCharId: selectedCharacterId
-                        });
-                    }
-                    beginRealPlayerMatch(oppPeer, isHostSide);
-                }
-            } else if (msg.type === 'MATCH_ACK') {
-                if (msg.hostId === localOnlineId && msg.guestId) {
-                    const oppPeer = { id: msg.guestId, characterId: msg.guestCharId };
-                    remoteOpponent = oppPeer;
-                    matchId = msg.matchId;
-                    if (!onlineMatchStarted) {
-                        beginRealPlayerMatch(oppPeer, true);
-                    }
-                }
-            } else if (msg.type === 'ARENA_STATE') {
-                if (!remoteOpponent || msg.senderId !== remoteOpponent.id) return;
-                applyRemoteArenaState(msg);
-            } else if (msg.type === 'ARENA_ACTION') {
-                if (!remoteOpponent || msg.senderId !== remoteOpponent.id) return;
-                applyRemoteArenaAction(msg);
             }
         }
-
-        function applyRemoteArenaState(msg) {
-            if (!ai) return;
-            // Espelha coordenadas X da arena para que ambos joguem da esquerda para a direita ou sincronizem posição real
-            ai.x = ARENA_WIDTH - msg.x;
-            ai.y = msg.y;
-            ai.angle = Math.PI - msg.angle;
-            ai.hp = Math.min(ai.maxHp, Math.max(0, msg.hp));
-            ai.debuffTimer = msg.debuffTimer || 0;
-            ai.stunTimer = msg.stunTimer || 0;
-            ai.burnTimer = msg.burnTimer || 0;
-            ai.loveTimer = msg.loveTimer || 0;
-            ai.dashTimer = msg.dashTimer || 0;
-            if (ai.hp <= 0 && currentState === GAME_STATE.PLAYING) {
-                endRound(true);
-            }
-        }
-
-        function applyRemoteArenaAction(msg) {
-            if (!ai) return;
-            if (msg.action === 'SHOOT') {
-                const prevX = ai.x;
-                const prevY = ai.y;
-                const prevAngle = ai.angle;
-                ai.x = ARENA_WIDTH - msg.x;
-                ai.y = msg.y;
-                ai.angle = Math.PI - msg.angle;
-                ai.shootCooldown = 0;
-                castWaterBall(ai);
-                ai.x = prevX;
-                ai.y = prevY;
-                ai.angle = prevAngle;
-            } else if (msg.action === 'SKILL') {
-                const prevX = ai.x;
-                const prevY = ai.y;
-                const prevAngle = ai.angle;
-                ai.x = ARENA_WIDTH - msg.x;
-                ai.y = msg.y;
-                ai.angle = Math.PI - msg.angle;
-                ai.waveCooldown = 0;
-                if (msg.botType) {
-                    spawnMechanicRobot(ai, msg.botType);
-                } else {
-                    castMiniWave(ai);
-                }
-                ai.x = prevX;
-                ai.y = prevY;
-                ai.angle = prevAngle;
-            }
-        }
-
         function startLobbyPresenceSync() {
             if (!peerInstance) {
                 initMultiplayerNetwork(activeRoomCode);
@@ -1797,7 +1702,9 @@
                     refreshRemoteLobbyPlayers();
                 } else if (currentState === GAME_STATE.WAITING_PLAYERS) {
                     publishOnlinePresence('WAITING');
-                } else if (currentState === GAME_STATE.PLAYING && player && remoteOpponent) {
+                } else if ((currentState === GAME_STATE.PLAYING || currentState === GAME_STATE.ROUND_INTRO) && player && remoteOpponent) {
+                    publishOnlinePresence('IN_MATCH');
+                    refreshRemoteLobbyPlayers();
                     broadcastToConnections({
                         type: 'ARENA_STATE',
                         senderId: localOnlineId,
@@ -1812,24 +1719,8 @@
                         dashTimer: player.dashTimer
                     });
                 }
-            }, 60);
+            }, 50);
         }
-
-        function removeOnlinePresence() {
-            const map = readOnlineQueue();
-            delete map[localOnlineId];
-            writeOnlineQueue(map);
-            remoteLobbyPlayers = {};
-            broadcastToConnections({ type: 'LEAVE', id: localOnlineId });
-        }
-
-        function stopOnlineMatchmakingLoop() {
-            if (onlineSyncInterval) {
-                clearInterval(onlineSyncInterval);
-                onlineSyncInterval = null;
-            }
-        }
-
         function handleIncomingPeer(peer) {
             if (!peer || !peer.id || peer.id === localOnlineId) return;
             const nowTs = Date.now();
@@ -1837,8 +1728,24 @@
 
             if (peer.status !== 'IN_MATCH') {
                 remoteLobbyPlayers[peer.id] = peer;
-            } else if (remoteLobbyPlayers[peer.id]) {
-                delete remoteLobbyPlayers[peer.id];
+            } else {
+                if (remoteLobbyPlayers[peer.id]) {
+                    delete remoteLobbyPlayers[peer.id];
+                }
+                if (remoteOpponent && peer.id === remoteOpponent.id && typeof peer.arenaX === 'number') {
+                    applyRemoteArenaState({
+                        senderId: peer.id,
+                        x: peer.arenaX,
+                        y: peer.arenaY,
+                        angle: peer.arenaAngle || 0,
+                        hp: typeof peer.arenaHp === 'number' ? peer.arenaHp : (ai ? ai.hp : 250),
+                        debuffTimer: peer.debuffTimer || 0,
+                        stunTimer: peer.stunTimer || 0,
+                        burnTimer: peer.burnTimer || 0,
+                        loveTimer: peer.loveTimer || 0,
+                        dashTimer: peer.dashTimer || 0
+                    });
+                }
             }
 
             if (currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted) {
@@ -1850,47 +1757,48 @@
 
         function initiateHandshakeWithPeer(peer) {
             if (!peer || !peer.id || onlineMatchStarted) return;
-            // Desempate determinístico pelo ID para apenas um lado gerar o matchId
-            if (localOnlineId < peer.id) {
-                const newMatchId = 'match_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
-                matchId = newMatchId;
-                remoteOpponent = peer;
-                const startPayload = {
-                    type: 'MATCH_START',
-                    matchId: newMatchId,
-                    hostId: localOnlineId,
-                    hostCharId: selectedCharacterId,
-                    guestId: peer.id,
-                    guestCharId: peer.characterId
-                };
-                persistActiveMatchRecord(startPayload);
+            const amHost = localOnlineId < peer.id;
+            const deterministicMatchId = amHost
+                ? `match_${localOnlineId}_${peer.id}`
+                : `match_${peer.id}_${localOnlineId}`;
+
+            matchId = deterministicMatchId;
+            remoteOpponent = peer;
+
+            const startPayload = {
+                type: 'MATCH_START',
+                matchId: deterministicMatchId,
+                hostId: amHost ? localOnlineId : peer.id,
+                hostCharId: amHost ? selectedCharacterId : peer.characterId,
+                guestId: amHost ? peer.id : localOnlineId,
+                guestCharId: amHost ? peer.characterId : selectedCharacterId
+            };
+
+            persistActiveMatchRecord(startPayload);
+            broadcastToConnections(startPayload);
+
+            // Reenvia o anúncio por 2s para garantir entrega em qualquer canal
+            if (matchHandshakeInterval) clearInterval(matchHandshakeInterval);
+            let retries = 0;
+            matchHandshakeInterval = setInterval(() => {
+                retries++;
+                if (retries > 12) {
+                    clearInterval(matchHandshakeInterval);
+                    matchHandshakeInterval = null;
+                    return;
+                }
                 broadcastToConnections(startPayload);
+            }, 150);
 
-                // Reenvia o anúncio por 1.5s para garantir que o segundo jogador receba mesmo se acabou de entrar
-                if (matchHandshakeInterval) clearInterval(matchHandshakeInterval);
-                let retries = 0;
-                matchHandshakeInterval = setInterval(() => {
-                    retries++;
-                    if (retries > 8) {
-                        clearInterval(matchHandshakeInterval);
-                        matchHandshakeInterval = null;
-                        return;
-                    }
-                    broadcastToConnections(startPayload);
-                }, 180);
-
-                beginRealPlayerMatch(peer, true);
-            } else {
-                // O lado convidado anuncia presença imediatamente para acelerar o recebimento do MATCH_START
-                publishOnlinePresence('WAITING');
-            }
+            // Ambos os jogadores entram imediatamente ao detectar o par na fila
+            beginRealPlayerMatch(peer, amHost);
         }
 
         function pollRealPlayers() {
             if (currentState !== GAME_STATE.WAITING_PLAYERS || onlineMatchStarted) return;
             publishOnlinePresence('WAITING');
 
-            // 1. Verifica se o outro jogador já registrou uma partida ativa conosco
+            // 1. Verifica se já existe partida ativa registrada para este jogador
             const sharedMatch = findSharedMatchForLocalPlayer();
             if (sharedMatch) {
                 const isHostSide = sharedMatch.hostId === localOnlineId;
@@ -4622,6 +4530,11 @@
                 if (currentState === GAME_STATE.WAITING_PLAYERS) {
                     pollRealPlayers();
                 }
+            } else if (event.key === 'arena_elemental_evt_v3' && event.newValue) {
+                try {
+                    const parsed = JSON.parse(event.newValue);
+                    handleNetworkMessage(parsed, null);
+                } catch (e) {}
             }
         });
 
