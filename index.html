@@ -479,15 +479,17 @@
         let roundHudFadeTimeout = null;
 
         // Estado do matchmaking online (apenas jogadores reais)
-        const ONLINE_ROOM_KEY = 'arena_elemental_online_queue_v1';
+        const ONLINE_ROOM_KEY = 'arena_elemental_online_queue_v2';
         const localOnlineId = 'player_' + Math.random().toString(36).slice(2, 10);
         let remoteOpponent = null;
         let onlineMatchStarted = false;
         let onlineSyncInterval = null;
+        let lobbyPresenceInterval = null;
+        let remoteLobbyPlayers = {};
         let broadcastChannel = null;
         if (typeof BroadcastChannel !== 'undefined') {
             try {
-                broadcastChannel = new BroadcastChannel('arena_elemental_real_players_v1');
+                broadcastChannel = new BroadcastChannel('arena_elemental_real_players_v2');
             } catch (e) {
                 broadcastChannel = null;
             }
@@ -839,6 +841,7 @@
             lobbyHud.classList.remove('hidden');
             lobbyBottomBar.classList.remove('hidden');
             updateLobbyUI();
+            startLobbyPresenceSync();
 
             // Posiciona jogador perto da entrada da Oficina
             lobbyPlayer.x = 600;
@@ -1407,18 +1410,27 @@
             } catch (e) {}
         }
 
-        function publishOnlinePresence(status = 'WAITING') {
-            const nowTs = Date.now();
-            const map = readOnlineQueue();
+        function pruneExpiredPeers(map, nowTs = Date.now()) {
             for (const key of Object.keys(map)) {
                 if (!map[key] || nowTs - (map[key].lastSeen || 0) > 6500) {
                     delete map[key];
                 }
             }
+            return map;
+        }
+
+        function publishOnlinePresence(status = 'WAITING') {
+            const nowTs = Date.now();
+            const map = pruneExpiredPeers(readOnlineQueue(), nowTs);
             map[localOnlineId] = {
                 id: localOnlineId,
                 characterId: selectedCharacterId,
                 status: status,
+                x: lobbyPlayer.x,
+                y: lobbyPlayer.y,
+                angle: lobbyPlayer.angle,
+                bobPhase: lobbyPlayer.bobPhase,
+                inSecretRoom: currentState === GAME_STATE.SECRET_ROOM,
                 lastSeen: nowTs
             };
             writeOnlineQueue(map);
@@ -1433,10 +1445,39 @@
             }
         }
 
+        function refreshRemoteLobbyPlayers() {
+            const nowTs = Date.now();
+            const map = pruneExpiredPeers(readOnlineQueue(), nowTs);
+            const updated = {};
+            for (const key of Object.keys(map)) {
+                if (key !== localOnlineId && map[key] && map[key].status !== 'IN_MATCH') {
+                    updated[key] = map[key];
+                }
+            }
+            remoteLobbyPlayers = updated;
+        }
+
+        function startLobbyPresenceSync() {
+            publishOnlinePresence(currentState === GAME_STATE.WAITING_PLAYERS ? 'WAITING' : 'LOBBY');
+            refreshRemoteLobbyPlayers();
+            if (lobbyPresenceInterval) {
+                clearInterval(lobbyPresenceInterval);
+            }
+            lobbyPresenceInterval = setInterval(() => {
+                if (currentState === GAME_STATE.LOBBY || currentState === GAME_STATE.SECRET_ROOM) {
+                    publishOnlinePresence('LOBBY');
+                    refreshRemoteLobbyPlayers();
+                } else if (currentState === GAME_STATE.WAITING_PLAYERS) {
+                    publishOnlinePresence('WAITING');
+                }
+            }, 350);
+        }
+
         function removeOnlinePresence() {
             const map = readOnlineQueue();
             delete map[localOnlineId];
             writeOnlineQueue(map);
+            remoteLobbyPlayers = {};
 
             if (broadcastChannel) {
                 try {
@@ -1460,9 +1501,18 @@
             const nowTs = Date.now();
             if (nowTs - (peer.lastSeen || 0) > 6500) return;
 
+            if (peer.status !== 'IN_MATCH') {
+                remoteLobbyPlayers[peer.id] = peer;
+            } else if (remoteLobbyPlayers[peer.id]) {
+                delete remoteLobbyPlayers[peer.id];
+            }
+
             if (currentState === GAME_STATE.WAITING_PLAYERS && !onlineMatchStarted) {
-                remoteOpponent = peer;
-                beginRealPlayerMatch(peer);
+                const isCompatiblePeer = peer.status === 'WAITING' || peer.status === 'LOBBY' || peer.status === 'IN_MATCH';
+                if (isCompatiblePeer) {
+                    remoteOpponent = peer;
+                    beginRealPlayerMatch(peer);
+                }
             }
         }
 
@@ -1470,14 +1520,15 @@
             if (currentState !== GAME_STATE.WAITING_PLAYERS || onlineMatchStarted) return;
             publishOnlinePresence('WAITING');
             const nowTs = Date.now();
-            const map = readOnlineQueue();
+            const map = pruneExpiredPeers(readOnlineQueue(), nowTs);
             const otherPeers = Object.values(map).filter(
                 p => p && p.id && p.id !== localOnlineId && (nowTs - (p.lastSeen || 0) <= 6500)
             );
 
             if (otherPeers.length > 0) {
-                remoteOpponent = otherPeers[0];
-                beginRealPlayerMatch(otherPeers[0]);
+                const waitingPeer = otherPeers.find(p => p.status === 'WAITING') || otherPeers[0];
+                remoteOpponent = waitingPeer;
+                beginRealPlayerMatch(waitingPeer);
             } else {
                 document.getElementById('waitingStatusDetail').textContent =
                     'Você entrou no portal. Nenhum outro jogador real encontrado ainda — aguardando jogadores...';
@@ -3189,315 +3240,56 @@
             // 5. Renderiza o Jogador caminhando no Lobby com a aparência do Espírito equipado
             const char = CHARACTERS[selectedCharacterId];
             const bobOffset = Math.sin(lobbyPlayer.bobPhase) * 2.5;
-            ctx.save();
-            ctx.translate(lobbyPlayer.x, lobbyPlayer.y + bobOffset);
 
-            // Sombra no chão
-            ctx.fillStyle = 'rgba(0,0,0,0.45)';
-            ctx.beginPath();
-            ctx.ellipse(0, 18 - bobOffset, 18, 8, 0, 0, Math.PI * 2);
-            ctx.fill();
+            // Renderiza outros jogadores reais presentes no mesmo lobby
+            for (const peer of Object.values(remoteLobbyPlayers)) {
+                if (!peer || peer.id === localOnlineId || peer.inSecretRoom) continue;
+                const pChar = CHARACTERS[peer.characterId] || CHARACTERS.water_spirit;
+                const pBob = Math.sin(peer.bobPhase || 0) * 2.5;
+                const px = typeof peer.x === 'number' ? peer.x : 640;
+                const py = typeof peer.y === 'number' ? peer.y : 540;
 
-            const pGradLobby = ctx.createRadialGradient(-5, -5, 3, 0, 0, lobbyPlayer.radius);
-            pGradLobby.addColorStop(0, '#ffffff');
-            pGradLobby.addColorStop(0.5, char.themeColor);
-            pGradLobby.addColorStop(1, char.darkColor);
-
-            ctx.fillStyle = pGradLobby;
-            ctx.shadowColor = char.themeColor;
-            ctx.shadowBlur = 16;
-            ctx.beginPath();
-            ctx.arc(0, 0, lobbyPlayer.radius, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.shadowBlur = 0;
-
-            ctx.strokeStyle = char.themeColor;
-            ctx.lineWidth = 2.5;
-            ctx.stroke();
-
-            // Olhos e adereços voltados para a direção da caminhada
-            ctx.rotate(lobbyPlayer.angle);
-            if (char.id === 'vampire') {
-                // Lacinho azul fixo na parte de trás da Vampira
                 ctx.save();
-                ctx.translate(-lobbyPlayer.radius - 2, 0);
-                ctx.rotate(Math.PI / 2);
-                ctx.fillStyle = '#2563eb';
-                ctx.strokeStyle = '#93c5fd';
-                ctx.lineWidth = 1.4;
+                ctx.translate(px, py + pBob);
+
+                ctx.fillStyle = 'rgba(0,0,0,0.45)';
                 ctx.beginPath();
-                ctx.moveTo(0, 0);
-                ctx.lineTo(-9, -6.5);
-                ctx.lineTo(-7, 0);
-                ctx.lineTo(-9, 6.5);
-                ctx.closePath();
+                ctx.ellipse(0, 18 - pBob, 18, 8, 0, 0, Math.PI * 2);
                 ctx.fill();
+
+                const peerGrad = ctx.createRadialGradient(-5, -5, 3, 0, 0, lobbyPlayer.radius);
+                peerGrad.addColorStop(0, '#ffffff');
+                peerGrad.addColorStop(0.5, pChar.themeColor);
+                peerGrad.addColorStop(1, pChar.darkColor);
+
+                ctx.fillStyle = peerGrad;
+                ctx.shadowColor = pChar.themeColor;
+                ctx.shadowBlur = 14;
+                ctx.beginPath();
+                ctx.arc(0, 0, lobbyPlayer.radius, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.shadowBlur = 0;
+
+                ctx.strokeStyle = pChar.themeColor;
+                ctx.lineWidth = 2.5;
                 ctx.stroke();
 
-                ctx.beginPath();
-                ctx.moveTo(0, 0);
-                ctx.lineTo(9, -6.5);
-                ctx.lineTo(7, 0);
-                ctx.lineTo(9, 6.5);
-                ctx.closePath();
-                ctx.fill();
-                ctx.stroke();
-
-                ctx.fillStyle = '#3b82f6';
-                ctx.beginPath();
-                ctx.arc(0, 0, 3.4, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.stroke();
-                ctx.restore();
-            }
-            if (char.id === 'conghy') {
-                // Canhão lateral decorativo (fora da hitbox)
-                ctx.fillStyle = '#334155';
-                ctx.strokeStyle = '#f59e0b';
-                ctx.lineWidth = 2;
-                ctx.beginPath();
-                ctx.roundRect(lobbyPlayer.radius * 0.25, lobbyPlayer.radius - 2, 22, 11, 3);
-                ctx.fill();
-                ctx.stroke();
-
-                // Corda e tapa-olho
-                ctx.strokeStyle = '#1c1917';
-                ctx.lineWidth = 2;
-                ctx.beginPath();
-                ctx.moveTo(-16, -9);
-                ctx.lineTo(14, 9);
-                ctx.stroke();
-
-                ctx.fillStyle = '#09090b';
-                ctx.strokeStyle = '#f59e0b';
-                ctx.lineWidth = 1.5;
-                ctx.beginPath();
-                ctx.arc(8, 6, 4.5, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.stroke();
-
-                ctx.fillStyle = '#ffffff';
-                ctx.beginPath();
-                ctx.arc(8, -6, 3.2, 0, Math.PI * 2);
-                ctx.fill();
-            } else {
+                ctx.rotate(peer.angle || -Math.PI / 2);
                 ctx.fillStyle = '#ffffff';
                 ctx.beginPath();
                 ctx.arc(8, -6, 3.2, 0, Math.PI * 2);
                 ctx.arc(8, 6, 3.2, 0, Math.PI * 2);
                 ctx.fill();
-            }
-            ctx.restore();
+                ctx.restore();
 
-            // 6. Brasas da Oficina flutuando no ar
-            for (const e of workshopEmbers) {
-                ctx.fillStyle = `rgba(251, 146, 60, ${e.alpha})`;
-                ctx.beginPath();
-                ctx.arc(e.x, e.y, e.size, 0, Math.PI * 2);
-                ctx.fill();
-            }
-
-            ctx.restore();
-        }
-
-        function renderSecretRoom(now) {
-            ctx.fillStyle = '#05060a';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-            ctx.save();
-            ctx.translate(offsetX, offsetY);
-            ctx.scale(renderScale, renderScale);
-
-            const rw = secretRoomBounds.right - secretRoomBounds.left;
-            const rh = secretRoomBounds.bottom - secretRoomBounds.top;
-            const rx = secretRoomBounds.left;
-            const ry = secretRoomBounds.top;
-
-            // Tapete pequeno no centro do quarto
-            const roomGrad = ctx.createRadialGradient(
-                rx + rw / 2, ry + rh / 2, 30,
-                rx + rw / 2, ry + rh / 2, rw * 0.65
-            );
-            roomGrad.addColorStop(0, '#1b2032');
-            roomGrad.addColorStop(1, '#0c0f19');
-            ctx.fillStyle = roomGrad;
-            ctx.beginPath();
-            ctx.roundRect(rx, ry, rw, rh, 22);
-            ctx.fill();
-
-            // Tábuas do piso do quarto menor
-            ctx.strokeStyle = 'rgba(148, 163, 184, 0.06)';
-            ctx.lineWidth = 1;
-            for (let y = ry + 36; y < secretRoomBounds.bottom; y += 36) {
-                ctx.beginPath();
-                ctx.moveTo(rx + 8, y);
-                ctx.lineTo(secretRoomBounds.right - 8, y);
-                ctx.stroke();
-            }
-
-            // Paredes do quarto menor com abertura na parte inferior central
-            ctx.strokeStyle = 'rgba(253, 224, 71, 0.35)';
-            ctx.lineWidth = 4;
-            ctx.beginPath();
-            ctx.moveTo(646, secretRoomBounds.bottom);
-            ctx.lineTo(secretRoomBounds.right - 14, secretRoomBounds.bottom);
-            ctx.quadraticCurveTo(secretRoomBounds.right, secretRoomBounds.bottom, secretRoomBounds.right, secretRoomBounds.bottom - 14);
-            ctx.lineTo(secretRoomBounds.right, ry + 14);
-            ctx.quadraticCurveTo(secretRoomBounds.right, ry, secretRoomBounds.right - 14, ry);
-            ctx.lineTo(rx + 14, ry);
-            ctx.quadraticCurveTo(rx, ry, rx, ry + 14);
-            ctx.lineTo(rx, secretRoomBounds.bottom - 14);
-            ctx.quadraticCurveTo(rx, secretRoomBounds.bottom, rx + 14, secretRoomBounds.bottom);
-            ctx.lineTo(554, secretRoomBounds.bottom);
-            ctx.stroke();
-
-            // Marca da saída inferior
-            ctx.strokeStyle = 'rgba(251, 191, 36, 0.45)';
-            ctx.setLineDash([6, 6]);
-            ctx.beginPath();
-            ctx.moveTo(554, secretRoomBounds.bottom);
-            ctx.lineTo(646, secretRoomBounds.bottom);
-            ctx.stroke();
-            ctx.setLineDash([]);
-            ctx.font = 'bold 10px "Plus Jakarta Sans", sans-serif';
-            ctx.textAlign = 'center';
-            ctx.fillStyle = 'rgba(251, 191, 36, 0.65)';
-            ctx.fillText('SAÍDA', 600, secretRoomBounds.bottom + 15);
-
-            // Cama real detalhada à esquerda (cabeceira, colchão, lençol, travesseiro e cobertor)
-            ctx.save();
-            ctx.translate(300, 185);
-            // Sombra da cama
-            ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
-            ctx.beginPath();
-            ctx.roundRect(4, 5, 120, 175, 10);
-            ctx.fill();
-            // Estrado de madeira
-            ctx.fillStyle = '#451a03';
-            ctx.strokeStyle = '#78350f';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.roundRect(0, 0, 120, 175, 9);
-            ctx.fill();
-            ctx.stroke();
-            // Cabeceira de madeira entalhada
-            ctx.fillStyle = '#5c2408';
-            ctx.beginPath();
-            ctx.roundRect(-2, -6, 124, 22, 6);
-            ctx.fill();
-            ctx.stroke();
-            // Colchão claro
-            ctx.fillStyle = '#e2e8f0';
-            ctx.beginPath();
-            ctx.roundRect(8, 18, 104, 149, 7);
-            ctx.fill();
-            // Travesseiro fofo
-            ctx.fillStyle = '#f8fafc';
-            ctx.strokeStyle = '#cbd5e1';
-            ctx.lineWidth = 1.5;
-            ctx.beginPath();
-            ctx.roundRect(20, 24, 80, 26, 7);
-            ctx.fill();
-            ctx.stroke();
-            // Cobertor dobrado com barra decorativa
-            const blanketGrad = ctx.createLinearGradient(8, 62, 8, 166);
-            blanketGrad.addColorStop(0, '#4c1d95');
-            blanketGrad.addColorStop(1, '#2e1065');
-            ctx.fillStyle = blanketGrad;
-            ctx.beginPath();
-            ctx.roundRect(8, 64, 104, 103, [4, 4, 8, 8]);
-            ctx.fill();
-            ctx.fillStyle = '#a855f7';
-            ctx.fillRect(8, 64, 104, 10);
-            ctx.restore();
-
-            // Pequeno criado-mudo com lamparina apagada ao lado da cama
-            ctx.fillStyle = '#3f1d0b';
-            ctx.strokeStyle = '#78350f';
-            ctx.lineWidth = 1.5;
-            ctx.beginPath();
-            ctx.roundRect(430, 188, 34, 34, 5);
-            ctx.fill();
-            ctx.stroke();
-            ctx.fillStyle = '#94a3b8';
-            ctx.beginPath();
-            ctx.arc(447, 205, 7, 0, Math.PI * 2);
-            ctx.fill();
-
-            // Bancada antiga do Mecânico à direita
-            ctx.fillStyle = '#1e2436';
-            ctx.strokeStyle = 'rgba(168, 85, 247, 0.35)';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.roundRect(765, 185, 135, 72, 8);
-            ctx.fill();
-            ctx.stroke();
-            // Ferramentas deixadas para trás na bancada
-            ctx.strokeStyle = '#94a3b8';
-            ctx.lineWidth = 3;
-            ctx.beginPath();
-            ctx.moveTo(785, 210);
-            ctx.lineTo(815, 232);
-            ctx.stroke();
-            ctx.fillStyle = '#c084fc';
-            ctx.beginPath();
-            ctx.arc(858, 220, 9, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.font = 'bold 10px "Plus Jakarta Sans", sans-serif';
-            ctx.fillStyle = 'rgba(203, 213, 225, 0.55)';
-            ctx.fillText('BANCADA DO INVENTOR', 832, 272);
-
-            ctx.font = 'bold 12px "Cinzel", serif';
-            ctx.textAlign = 'center';
-            ctx.fillStyle = 'rgba(226, 232, 240, 0.42)';
-            ctx.fillText('• ANTIGO QUARTO DO INVENTOR (ELE NÃO MORA MAIS AQUI) •', 600, ry + 24);
-
-            if (commonPersonPresent) {
                 ctx.save();
-                ctx.translate(commonPersonNpc.x, commonPersonNpc.y);
-
-                ctx.fillStyle = 'rgba(0,0,0,0.45)';
-                ctx.beginPath();
-                ctx.ellipse(0, 20, 18, 8, 0, 0, Math.PI * 2);
-                ctx.fill();
-
-                ctx.fillStyle = '#475569';
-                ctx.strokeStyle = '#cbd5e1';
-                ctx.lineWidth = 2.5;
-                ctx.beginPath();
-                ctx.arc(0, 0, commonPersonNpc.radius, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.stroke();
-
-                // Chapéu de detetive (fedora)
-                ctx.fillStyle = '#334155';
-                ctx.strokeStyle = '#94a3b8';
-                ctx.lineWidth = 1.8;
-                ctx.beginPath();
-                ctx.ellipse(0, -16, 24, 6, 0, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.stroke();
-
-                ctx.beginPath();
-                ctx.roundRect(-12, -29, 24, 14, [6, 6, 2, 2]);
-                ctx.fill();
-                ctx.stroke();
-
-                // Olhos da Pessoa Comum
-                ctx.fillStyle = '#ffffff';
-                ctx.beginPath();
-                ctx.arc(-6, -2, 2.8, 0, Math.PI * 2);
-                ctx.arc(6, -2, 2.8, 0, Math.PI * 2);
-                ctx.fill();
-
-                ctx.font = 'bold 12px "Plus Jakarta Sans", sans-serif';
-                ctx.fillStyle = '#fde68a';
-                ctx.fillText('PESSOA COMUM', 0, 38);
+                ctx.font = 'bold 11px "Plus Jakarta Sans", sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillStyle = '#e2e8f0';
+                ctx.fillText(`Jogador (${pChar.name})`, px, py - lobbyPlayer.radius - 10);
                 ctx.restore();
             }
 
-            const char = CHARACTERS[selectedCharacterId];
-            const bobOffset = Math.sin(lobbyPlayer.bobPhase) * 2.5;
             ctx.save();
             ctx.translate(lobbyPlayer.x, lobbyPlayer.y + bobOffset);
 
@@ -4384,19 +4176,27 @@
                 if (!msg) return;
                 if (msg.type === 'PRESENCE') {
                     handleIncomingPeer(msg.peer);
-                } else if (msg.type === 'LEAVE' && remoteOpponent && msg.id === remoteOpponent.id) {
-                    remoteOpponent = null;
-                    if (currentState === GAME_STATE.PLAYING || currentState === GAME_STATE.ROUND_INTRO || currentState === GAME_STATE.ROUND_OVER) {
-                        onlineMatchStarted = false;
-                        enterWaitingForRealPlayers();
+                } else if (msg.type === 'LEAVE' && msg.id) {
+                    if (remoteLobbyPlayers[msg.id]) {
+                        delete remoteLobbyPlayers[msg.id];
+                    }
+                    if (remoteOpponent && msg.id === remoteOpponent.id) {
+                        remoteOpponent = null;
+                        if (currentState === GAME_STATE.PLAYING || currentState === GAME_STATE.ROUND_INTRO || currentState === GAME_STATE.ROUND_OVER) {
+                            onlineMatchStarted = false;
+                            enterWaitingForRealPlayers();
+                        }
                     }
                 }
             });
         }
 
         window.addEventListener('storage', (event) => {
-            if (event.key === ONLINE_ROOM_KEY && currentState === GAME_STATE.WAITING_PLAYERS) {
-                pollRealPlayers();
+            if (event.key === ONLINE_ROOM_KEY) {
+                refreshRemoteLobbyPlayers();
+                if (currentState === GAME_STATE.WAITING_PLAYERS) {
+                    pollRealPlayers();
+                }
             }
         });
 
@@ -4468,6 +4268,7 @@
             resizeCanvas();
             setupArenaWalls();
             initWorkshopEmbers();
+            startLobbyPresenceSync();
             lastTime = performance.now();
             requestAnimationFrame(gameLoop);
         };
